@@ -142,6 +142,7 @@ import static org.wso2.carbon.identity.core.util.IdentityCoreConstants.MULTI_ATT
 import static org.wso2.carbon.identity.organization.management.service.constant.OrganizationManagementConstants.ErrorMessages.ERROR_CODE_EMAIL_DOMAIN_ASSOCIATED_WITH_DIFFERENT_ORGANIZATION;
 import static org.wso2.carbon.identity.organization.management.service.constant.OrganizationManagementConstants.ErrorMessages.ERROR_CODE_EMAIL_DOMAIN_NOT_MAPPED_TO_ORGANIZATION;
 import static org.wso2.carbon.identity.scim2.common.utils.SCIMCommonUtils.buildCustomSchema;
+import static org.wso2.carbon.identity.scim2.common.utils.SCIMCommonUtils.buildSystemSchema;
 import static org.wso2.carbon.identity.scim2.common.utils.SCIMCommonUtils.getCustomSchemaURI;
 import static org.wso2.carbon.identity.scim2.common.utils.SCIMCommonUtils
         .isFilterUsersAndGroupsOnlyFromPrimaryDomainEnabled;
@@ -1472,6 +1473,9 @@ public class SCIMUserManager implements UserManager {
         domainName = resolveDomainName(domainName, node);
         int totalResults = 0;
         try {
+            if (limit == 0) {
+                limit = getMaxLimit(domainName);
+            }
             // Check which APIs should the filter needs to follow.
             if (isUseLegacyAPIs(limit)) {
                 users = filterUsersUsingLegacyAPIs(node, limit, offset, domainName);
@@ -1548,6 +1552,9 @@ public class SCIMUserManager implements UserManager {
 
     private int getMaxLimitForTotalResults(String domainName) {
 
+        if (StringUtils.isEmpty(domainName)) {
+            domainName = getPrimaryUserStoreDomain();
+        }
         int maxLimit = getMaxLimit(domainName);
         if (isJDBCUSerStore(domainName) && !SCIMCommonUtils.isConsiderMaxLimitForTotalResultEnabled()) {
             maxLimit = Integer.MAX_VALUE;
@@ -1615,11 +1622,7 @@ public class SCIMUserManager implements UserManager {
         String filterOperation = node.getOperation();
         String attributeValue = node.getValue();
 
-        String primaryUSDomain = carbonUM.getRealmConfiguration().getUserStoreProperty(UserCoreConstants.
-                RealmConfig.PROPERTY_DOMAIN_NAME);
-        if (StringUtils.isEmpty(primaryUSDomain)) {
-            primaryUSDomain = UserCoreConstants.PRIMARY_DEFAULT_DOMAIN_NAME;
-        }
+        String primaryUSDomain = getPrimaryUserStoreDomain();
         if ((isFilterUsersAndGroupsOnlyFromPrimaryDomainEnabled()) && !StringUtils
                 .contains(attributeValue, CarbonConstants.DOMAIN_SEPARATOR)) {
             return primaryUSDomain;
@@ -1718,22 +1721,16 @@ public class SCIMUserManager implements UserManager {
         // Set filter values.
         String attributeName = ((ExpressionNode) node).getAttributeValue();
         String filterOperation = ((ExpressionNode) node).getOperation();
-        String attributeValue = ((ExpressionNode) node).getValue();
 
         /*
         If there is a domain and if the domain separator is not found in the attribute value, append the domain
         with the domain separator in front of the new attribute value.
          */
-        attributeValue = UserCoreUtil.addDomainToName(((ExpressionNode) node).getValue(), domainName);
+        String attributeValue = UserCoreUtil.addDomainToName(((ExpressionNode) node).getValue(), domainName);
 
         try {
             List<String> roleNames = getRoleNames(attributeName, filterOperation, attributeValue);
-            Set<org.wso2.carbon.user.core.common.User> users;
-            if (SCIMCommonUtils.isGroupBasedUserFilteringImprovementsEnabled()) {
-                users = getUserListOfGroups(roleNames);
-            } else {
-                users = getUserListOfRoles(roleNames);
-            }
+            Set<org.wso2.carbon.user.core.common.User> users = getUserListOfRoles(roleNames);
             users = paginateUsers(users, limit, offset);
             return users;
         } catch (UserStoreException e) {
@@ -1763,7 +1760,8 @@ public class SCIMUserManager implements UserManager {
             throws CharonException, BadRequestException {
 
         // Filter users when filter by group.
-        if (SCIMConstants.UserSchemaConstants.GROUP_URI.equals(((ExpressionNode) node).getAttributeValue())) {
+        if (!SCIMCommonUtils.isGroupBasedUserFilteringImprovementsEnabled() &&
+                SCIMConstants.UserSchemaConstants.GROUP_URI.equals(((ExpressionNode) node).getAttributeValue())) {
             return filterUsersByGroup(node, offset, limit, domainName);
         }
 
@@ -2064,11 +2062,8 @@ public class SCIMUserManager implements UserManager {
         // Sorting the secondary user stores to maintain an order fo domains so that pagination is consistent.
         Collections.sort(domainsOfUserStores);
 
-        String primaryUSDomain = carbonUM.getRealmConfiguration().getUserStoreProperty(UserCoreConstants.
-                RealmConfig.PROPERTY_DOMAIN_NAME);
-        if (StringUtils.isEmpty(primaryUSDomain)) {
-            primaryUSDomain = UserCoreConstants.PRIMARY_DEFAULT_DOMAIN_NAME;
-        }
+        String primaryUSDomain = getPrimaryUserStoreDomain();
+
         // Append the primary domain name to the front of the domain list since the first iteration of multiple
         // domain filtering should happen for the primary user store.
         domainsOfUserStores.add(0, primaryUSDomain);
@@ -2168,7 +2163,6 @@ public class SCIMUserManager implements UserManager {
                                                         String domainName) throws CharonException, BadRequestException {
 
         List<User> filteredUserDetails;
-        int maxLimit = getMaxLimitForTotalResults(domainName);
 
         int totalResults = 0;
         PaginatedUserResponse paginatedUserResult;
@@ -2178,25 +2172,27 @@ public class SCIMUserManager implements UserManager {
             paginatedUserResult = getMultiAttributeFilteredUsersWithMaxLimit(node, offset, sortBy, sortOrder, domainName, limit,
                     true);
         } else {
-            paginatedUserResult = getMultiAttributeFilteredUsersWithMaxLimit(node, offset, sortBy, sortOrder, domainName, maxLimit,
-                    false);
+            int maxLimit = getMaxLimit(domainName);
+            paginatedUserResult = getMultiAttributeFilteredUsersWithMaxLimit(node, offset, sortBy, sortOrder,
+                    domainName, maxLimit, false);
         }
         filteredUserDetails = getFilteredUserDetails(new LinkedHashSet<>(paginatedUserResult.getFilteredUsers()),
                 requiredAttributes);
 
+        int maxLimitForTotalResults = getMaxLimitForTotalResults(domainName);
         // Check that total user count matching the client query needs to be calculated.
         if (paginatedUserResult.getTotalResults() > 0) {
             /* If the total result is provided with the paginated user result, give the priority instead of calculating
                 user total count. */
             totalResults = paginatedUserResult.getTotalResults();
-            if (totalResults > maxLimit && SCIMCommonUtils.isConsiderMaxLimitForTotalResultEnabled()) {
-                totalResults = maxLimit;
+            if (totalResults > maxLimitForTotalResults && SCIMCommonUtils.isConsiderMaxLimitForTotalResultEnabled()) {
+                totalResults = maxLimitForTotalResults;
             }
         } else {
             if (isJDBCUSerStore(domainName) || isAllConfiguredUserStoresJDBC() ||
                     SCIMCommonUtils.isConsiderTotalRecordsForTotalResultOfLDAPEnabled()) {
                 // Get total users based on the filter query.
-                totalResults += getMultiAttributeFilteredUsersCount(node, 1, domainName, maxLimit);
+                totalResults += getMultiAttributeFilteredUsersCount(node, 1, domainName, maxLimitForTotalResults);
 
             } else {
                 totalResults += paginatedUserResult.getFilteredUsers().size();
@@ -2263,11 +2259,7 @@ public class SCIMUserManager implements UserManager {
 
         int givenMax = UserCoreConstants.MAX_USER_ROLE_LIST;
         if (StringUtils.isEmpty(domainName)) {
-            domainName = carbonUM.getRealmConfiguration().getUserStoreProperty(UserCoreConstants.RealmConfig.
-                    PROPERTY_DOMAIN_NAME);
-            if (StringUtils.isEmpty(domainName)) {
-                domainName = UserCoreConstants.PRIMARY_DEFAULT_DOMAIN_NAME;
-            }
+            domainName = getPrimaryUserStoreDomain();
             if (log.isDebugEnabled()) {
                 log.debug("Primary user store DomainName picked as " + domainName);
             }
@@ -2479,11 +2471,7 @@ public class SCIMUserManager implements UserManager {
 
         try {
             if (StringUtils.isEmpty(domainName)) {
-                domainName = carbonUM.getRealmConfiguration().getUserStoreProperty(UserCoreConstants.RealmConfig.
-                        PROPERTY_DOMAIN_NAME);
-                if (StringUtils.isEmpty(domainName)) {
-                    domainName = UserCoreConstants.PRIMARY_DEFAULT_DOMAIN_NAME;
-                }
+                domainName = getPrimaryUserStoreDomain();
                 if (log.isDebugEnabled()) {
                     log.debug("Primary user store DomainName picked as " + domainName);
                 }
@@ -3370,11 +3358,7 @@ public class SCIMUserManager implements UserManager {
      */
     private String getDomainWithFilterProperties(ExpressionNode node) {
 
-        String primaryUSDomain = carbonUM.getRealmConfiguration().getUserStoreProperty(UserCoreConstants.
-                RealmConfig.PROPERTY_DOMAIN_NAME);
-        if (StringUtils.isEmpty(primaryUSDomain)) {
-            primaryUSDomain = UserCoreConstants.PRIMARY_DEFAULT_DOMAIN_NAME;
-        }
+        String primaryUSDomain = getPrimaryUserStoreDomain();
         if (isFilterUsersAndGroupsOnlyFromPrimaryDomainEnabled()) {
             return primaryUSDomain;
         } else if (isFilteringEnhancementsEnabled()) {
@@ -3527,9 +3511,6 @@ public class SCIMUserManager implements UserManager {
             List<PatchOperation> displayNameOperations = new ArrayList<>();
             List<PatchOperation> memberOperations = new ArrayList<>();
             String newGroupName = currentGroupName;
-            Date groupLastUpdatedTime = null;
-            String groupNameForIDNScim = SCIMCommonUtils.getGroupNameWithDomain(currentGroupName);
-
             for (List<PatchOperation> patchOperationList : patchOperations.values()) {
                 for (PatchOperation patchOperation : patchOperationList) {
                     if (StringUtils.equals(SCIMConstants.GroupSchemaConstants.DISPLAY_NAME,
@@ -3546,14 +3527,7 @@ public class SCIMUserManager implements UserManager {
 
             if (CollectionUtils.isNotEmpty(displayNameOperations)) {
                 newGroupName = (String) displayNameOperations.get(0).getValues();
-                String[] resolvedGroupNames = resolveGroupDomains(currentGroupName, newGroupName);
-                boolean groupUpdated = setGroupDisplayName(groupId, resolvedGroupNames[0], resolvedGroupNames[1]);
-                if (groupUpdated) {
-                    groupLastUpdatedTime = new Date();
-                    groupNameForIDNScim = resolvedGroupNames[1];
-                } else {
-                    groupNameForIDNScim = resolvedGroupNames[0];
-                }
+                setGroupDisplayName(groupId, currentGroupName, newGroupName);
             }
 
             Collections.sort(memberOperations);
@@ -3639,20 +3613,10 @@ public class SCIMUserManager implements UserManager {
                 carbonUM.updateUserListOfRoleWithID(newGroupName,
                         deletedMemberIdsFromUserstore.toArray(new String[0]),
                         addedMemberIdsFromUserstore.toArray(new String[0]));
-                groupLastUpdatedTime = new Date();
             }
 
             // Update the group name in UM_HYBRID_GROUP_ROLE table.
             carbonUM.updateGroupName(currentGroupName, newGroupName);
-
-            // Update the last modified time of the group.
-            if (!carbonUM.isUniqueGroupIdEnabled() && groupLastUpdatedTime != null) {
-                Map<String, String> attributes = new HashMap<>();
-                attributes.put(SCIMConstants.CommonSchemaConstants.LAST_MODIFIED_URI,
-                        AttributeUtil.formatDateTime(groupLastUpdatedTime.toInstant()));
-                SCIMGroupHandler groupHandler = new SCIMGroupHandler(carbonUM.getTenantId());
-                groupHandler.updateSCIMAttributes(groupNameForIDNScim, attributes);
-            }
         } catch (UserStoreException e) {
             if (e instanceof org.wso2.carbon.user.core.UserStoreException && (StringUtils
                     .equals(UserCoreErrorConstants.ErrorMessages.ERROR_CODE_DUPLICATE_WHILE_WRITING_TO_DATABASE
@@ -3720,10 +3684,12 @@ public class SCIMUserManager implements UserManager {
         }
     }
 
-    private String[] resolveGroupDomains(String oldGroupName, String newGroupName)
-            throws IdentityApplicationManagementException, CharonException, IdentitySCIMException {
+    private void setGroupDisplayName(String groupId, String oldGroupName, String newGroupName)
+            throws IdentityApplicationManagementException, CharonException, BadRequestException, IdentitySCIMException,
+            UserStoreException {
 
         String userStoreDomainFromSP = getUserStoreDomainFromSP();
+
         String oldGroupDomain = IdentityUtil.extractDomainFromName(oldGroupName);
         if (userStoreDomainFromSP != null && !userStoreDomainFromSP.equalsIgnoreCase(oldGroupDomain)) {
             throw new CharonException("Group :" + oldGroupName + "is not belong to user store " +
@@ -3749,19 +3715,10 @@ public class SCIMUserManager implements UserManager {
         oldGroupName = SCIMCommonUtils.getGroupNameWithDomain(oldGroupName);
         newGroupName = SCIMCommonUtils.getGroupNameWithDomain(newGroupName);
 
-        return new String[] { oldGroupName, newGroupName };
-    }
-
-    private boolean setGroupDisplayName(String groupId, String oldGroupName, String newGroupName)
-            throws IdentityApplicationManagementException, IdentitySCIMException, UserStoreException {
-
         if (!StringUtils.equals(oldGroupName, newGroupName)) {
             // Update group name in carbon UM.
             carbonUM.renameGroup(groupId, newGroupName);
-            return true;
         }
-
-        return false;
     }
 
     @Override
@@ -3808,9 +3765,6 @@ public class SCIMUserManager implements UserManager {
 
     public boolean doUpdateGroup(Group oldGroup, Group newGroup) throws CharonException, IdentitySCIMException,
             BadRequestException, IdentityApplicationManagementException, org.wso2.carbon.user.core.UserStoreException {
-
-        Date groupLastUpdatedTime = null;
-        String groupNameForIDNScim = SCIMCommonUtils.getGroupNameWithDomain(oldGroup.getDisplayName());
 
         setGroupDisplayName(oldGroup, newGroup);
         if (log.isDebugEnabled()) {
@@ -3860,8 +3814,6 @@ public class SCIMUserManager implements UserManager {
             // Update group name in carbon UM
             carbonUM.renameGroup(oldGroup.getId(), newGroupDisplayName);
             updated = true;
-            groupLastUpdatedTime = new Date();
-            groupNameForIDNScim = SCIMCommonUtils.getGroupNameWithDomain(newGroupDisplayName);
         }
         // Update the group with added members and deleted members.
         if (isNotEmpty(addedMembers) || isNotEmpty(deletedMembers)) {
@@ -3869,18 +3821,7 @@ public class SCIMUserManager implements UserManager {
                     deletedMemberIdsFromUserstore.toArray(new String[0]),
                     addedMemberIdsFromUserstore.toArray(new String[0]));
             updated = true;
-            groupLastUpdatedTime = new Date();
         }
-
-        // Update the last modified time of the group.
-        if (!carbonUM.isUniqueGroupIdEnabled() && groupLastUpdatedTime != null) {
-            Map<String, String> attributes = new HashMap<>();
-            attributes.put(SCIMConstants.CommonSchemaConstants.LAST_MODIFIED_URI,
-                    AttributeUtil.formatDateTime(groupLastUpdatedTime.toInstant()));
-            SCIMGroupHandler groupHandler = new SCIMGroupHandler(carbonUM.getTenantId());
-            groupHandler.updateSCIMAttributes(groupNameForIDNScim, attributes);
-        }
-
         return updated;
     }
 
@@ -5509,6 +5450,13 @@ public class SCIMUserManager implements UserManager {
             }
         }
         /*
+        If the newClaimList has a claim with empty value and the claim is not exist in the oldClaimList, remove that
+        claim from newClaimList.
+         */
+        newClaimList.entrySet()
+                .removeIf(entry -> entry.getValue().isEmpty() && !oldClaimList.containsKey(entry.getKey()));
+
+        /*
         Prepare user claims expect multi-valued claims to be added, deleted and modified.
         Remove simple multi-valued claims URIS from existing claims and updated user's claims.
         oldClaimList and newClaimList are not modifying to reuse for NotImplemented exception.
@@ -6573,6 +6521,25 @@ public class SCIMUserManager implements UserManager {
     }
 
     /**
+     * Returns SCIM2 system AttributeSchema of the tenant.
+     *
+     * @return Returns scim2 system schema
+     * @throws CharonException
+     */
+    @Override
+    public AttributeSchema getCustomAttributeSchemaInSystemExtension() throws CharonException {
+
+        if (tenantDomain != null) {
+            try {
+                return buildSystemSchema(carbonUM.getTenantId());
+            } catch (UserStoreException e) {
+                throw new CharonException("Error while building scim custom schema", e);
+            }
+        }
+        return null;
+    }
+
+    /**
      * Returns SCIM2 custom AttributeSchema of the tenant.
      *
      * @return Returns scim2 custom schema
@@ -6849,14 +6816,10 @@ public class SCIMUserManager implements UserManager {
             AbstractUserStoreManager tempCarbonUM = carbonUM;
             // If domain name are not given, then perform filtering on all available user stores.
             while (tempCarbonUM != null && maxLimit > 0) {
-                // If carbonUM is not an instance of Abstract User Store Manger we can't get the domain name.
-                if (tempCarbonUM instanceof AbstractUserStoreManager) {
-                    domainName =
-                            tempCarbonUM.getRealmConfiguration().getUserStoreProperty(UserCoreConstants.RealmConfig.
-                                    PROPERTY_DOMAIN_NAME);
-                    filteredUsersCount +=
-                            getMultiAttributeFilteredUsersCountFromSingleDomain(node, offset, domainName, maxLimit);
-                }
+                domainName = tempCarbonUM.getRealmConfiguration().getUserStoreProperty(UserCoreConstants.RealmConfig.
+                                PROPERTY_DOMAIN_NAME);
+                filteredUsersCount +=
+                        getMultiAttributeFilteredUsersCountFromSingleDomain(node, offset, domainName, maxLimit);
                 // If secondary user store manager assigned to carbonUM then global variable carbonUM will contains the
                 // secondary user store manager.
                 tempCarbonUM = (AbstractUserStoreManager) tempCarbonUM.getSecondaryUserStoreManager();
@@ -6929,5 +6892,48 @@ public class SCIMUserManager implements UserManager {
 
         // When required users are retrieved and limit is set to zero, skip iterating the user stores.
         return limit > 0;
+    }
+
+    /**
+     * Method to get the scim attributes mapped to a single local claim.
+     *
+     * @return Map of scim attributes mapped to a single local claim.
+     * @throws CharonException
+     */
+    public Map<String, String> getSyncedUserAttributes() throws CharonException {
+
+        try {
+            Map<String, String> scimToLocalMappings = SCIMCommonUtils.getSCIMtoLocalMappings();
+            Map<String, List<String>> localToScimMappings = new HashMap<>();
+            Map<String, String> syncedAttributes = new HashMap<>();
+
+            scimToLocalMappings.forEach((scimAttribute, localAttribute) ->
+                    localToScimMappings.computeIfAbsent(localAttribute, k -> new ArrayList<>()).add(scimAttribute)
+            );
+            localToScimMappings.values().stream()
+                    .filter(scimAttributes -> scimAttributes.size() > 1)
+                    .forEach(scimAttributes -> {
+                        for (int i = 0; i < scimAttributes.size(); i++) {
+                            for (int j = i + 1; j < scimAttributes.size(); j++) {
+                                syncedAttributes.put(scimAttributes.get(i), scimAttributes.get(j));
+                                syncedAttributes.put(scimAttributes.get(j), scimAttributes.get(i));
+                            }
+                        }
+                    });
+
+            return syncedAttributes;
+        } catch (org.wso2.carbon.user.core.UserStoreException e) {
+            throw new CharonException("Error while retrieving scim to local mappings.", e);
+        }
+    }
+
+    private String getPrimaryUserStoreDomain() {
+
+        String primaryUSDomain = carbonUM.getRealmConfiguration().getUserStoreProperty(UserCoreConstants.
+                RealmConfig.PROPERTY_DOMAIN_NAME);
+        if (StringUtils.isEmpty(primaryUSDomain)) {
+            primaryUSDomain = UserCoreConstants.PRIMARY_DEFAULT_DOMAIN_NAME;
+        }
+        return primaryUSDomain;
     }
 }
